@@ -129,11 +129,20 @@ class Upstream:
         return False
 
 
+_PYTHON_BIN_RE = re.compile(r"python(\.exe)?|python3(\.\d+)?(\.exe)?", re.IGNORECASE)
+
+
+def _is_python_binary(path):
+    """Match python binaries across platforms: python, python3, python3.15, .exe variants."""
+    name = path.replace("\\", "/").split("/")[-1]
+    return _PYTHON_BIN_RE.fullmatch(name) is not None
+
+
 def _resolve_executable():
     raw = os.environ.get("HH_OPENCODE", "")
     if raw:
         first, sep, rest = raw.partition(" ")
-        if sep and os.path.basename(first).lower() in ("python", "python3", "python.exe"):
+        if sep and _is_python_binary(first):
             return [first, rest]
         return [raw]
     found = shutil.which("opencode")

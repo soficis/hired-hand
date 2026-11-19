@@ -192,6 +192,33 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("opencode not found", result.stderr)
 
+    def test_resolve_executable_splits_versioned_python(self):
+        old = os.environ.get("HH_OPENCODE")
+        try:
+            os.environ["HH_OPENCODE"] = "/opt/homebrew/bin/python3.15 /tmp/fake-opencode"
+            self.assertEqual(
+                runner._resolve_executable(),
+                ["/opt/homebrew/bin/python3.15", "/tmp/fake-opencode"],
+            )
+            os.environ["HH_OPENCODE"] = (
+                "C:\\hostedtoolcache\\Python\\3.12.10\\x64\\python3.exe "
+                "C:\\work\\fake-opencode"
+            )
+            self.assertEqual(
+                runner._resolve_executable(),
+                [
+                    "C:\\hostedtoolcache\\Python\\3.12.10\\x64\\python3.exe",
+                    "C:\\work\\fake-opencode",
+                ],
+            )
+            os.environ["HH_OPENCODE"] = "opencode"
+            self.assertEqual(runner._resolve_executable(), ["opencode"])
+        finally:
+            if old is None:
+                os.environ.pop("HH_OPENCODE", None)
+            else:
+                os.environ["HH_OPENCODE"] = old
+
 
 if __name__ == "__main__":
     unittest.main()
