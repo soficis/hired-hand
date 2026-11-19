@@ -170,6 +170,16 @@ the trade this tool exists to make.
 An example model id is `provider/model-name`; use whatever id your provider
 publishes.
 
+Peak hours: when your first-choice model returns 429/overloaded (exit 6),
+point the retry at a cheap fallback. `hy4-flash-free` is one current option;
+it trains, so use it only inside an approved root.
+
+```bash
+HH_MODEL=provider/deepseek-flash \
+HH_RETRY_MODELS="provider/hy4-flash-free" \
+hiredhand build --yes spec.md
+```
+
 ## Exit codes
 
 | Code | Meaning |
