@@ -1,10 +1,51 @@
 # hired-hand
 
-`hiredhand` hands a fully written spec to an OpenCode agent, runs it under a
-watchdog, reports what changed in the working tree, and keeps a local JSONL run
-log. It is provider-neutral: you choose the model id. It also has a training
-guard that refuses models which may train on what they read outside project
-roots you have explicitly approved.
+**Your expensive model writes the plan. Your cheap model does the work.**
+
+`hiredhand` carries the baton between them.
+
+Claude plans. DeepSeek builds. Your token budget goes to thinking, not typing.
+
+## The problem
+
+You pay for two AI plans. They have different strengths.
+
+Claude Pro gives you a strong planner and a metered budget. Every file edit spends that budget on boilerplate. A $10 OpenCode Go plan gives you cheap models that follow a written spec well. They do not need to be brilliant. They need instructions.
+
+A build run can touch twenty files. Each edit burns planner tokens. The cheap model does the same work for pennies.
+
+So write the spec once. Hand it to the cheap model. Keep the expensive plan for planning and review.
+
+## What it does
+
+`hiredhand` runs one OpenCode agent on one spec file.
+
+- It runs the agent under a watchdog: wall-clock limit, idle limit, loop detection, provider-error detection.
+- It refuses a write-capable build without `--yes`.
+- It refuses a dirty git tree unless you allow it.
+- It reports what changed: files, insertions, deletions, new files, whether HEAD moved.
+- It appends one JSONL line per run.
+- It blocks secret-like paths for training-class models.
+
+You choose the model id. The tool has no vendor lock-in.
+
+## Ways people use it
+
+**Claude hands off the typing.** Ask Claude Code to write `spec.md`. Then ask it to run `hiredhand build --yes spec.md`. Claude plans once and spends its quota on review instead of forty edits.
+
+**You drive it by hand.** Write a spec in your editor. Run one command. Read the diff.
+
+**Any agent with a shell drives it.** Cursor, Aider, Codex, a Makefile, a cron job, a CI step. The contract is a file and an exit code.
+
+**Cross-model review.** Build with one model. Review with another. Different vendors catch different mistakes.
+
+**Parallel worktrees.** One spec per worktree. Cheap models make parallel runs affordable.
+
+**Overnight batches.** Queue a list of specs. Read the log in the morning.
+
+**Cost tracking.** `hiredhand stats` groups runs and outcomes by model.
+
+**Free-tier safety.** Free models may train on what they read. The guard refuses them outside approved roots and denies secret-like paths inside.
 
 ## Requirements
 
@@ -14,8 +55,7 @@ roots you have explicitly approved.
 - Python >= 3.8 (standard library only)
 - the `opencode` CLI
 
-Windows Git Bash and Linux (including WSL) are tested. macOS uses portable code
-paths but is not tested here.
+Windows Git Bash and Linux (including WSL) are tested. macOS uses portable code paths but is not tested here.
 
 ## Install
 
@@ -32,9 +72,9 @@ PREFIX="$HOME/tools" bash install.sh
 bash install.sh --uninstall
 ```
 
-## Quickstart
+## Quickstart: the baton
 
-Write a spec file:
+**Step 1. Write a spec.** Claude can do this part.
 
 ```markdown
 # Add a health endpoint
@@ -50,18 +90,23 @@ Add `GET /health` returning `{"ok": true}`.
 - `python -m unittest tests.test_server`
 ```
 
-Preview the command without running anything:
+**Step 2. Run the cheap model.**
+
+```bash
+HH_MODEL=provider/model-name hiredhand build --yes spec.md
+```
+
+**Step 3. Read the report and the diff.**
+
+```bash
+git diff
+hiredhand outcome <run-id> pass 1200 "health endpoint added"
+```
+
+Preview a command without running anything:
 
 ```bash
 HH_MODEL=provider/model-name hiredhand review --dry-run spec.md
-```
-
-Run a review, then a write-capable build:
-
-```bash
-HH_MODEL=provider/model-name hiredhand review spec.md
-HH_MODEL=provider/model-name hiredhand build --yes spec.md
-hiredhand outcome <run-id> pass 1200 "health endpoint added"
 ```
 
 Review uses the `plan` agent and asks it not to edit, but it is not a sandbox.
@@ -71,13 +116,19 @@ not report changes in review mode.
 `build` refuses to start without `--yes` or `HH_YES=1`. It also refuses on a
 dirty git tree unless `HH_DIRTY=1` is set.
 
-## Writing a good spec
+## The spec is the interface
+
+The spec is the contract between the planner and the builder. Write it once.
+Both models read the same words.
 
 State the goal, the files in scope, the acceptance commands, and any
 constraints. Keep the scope narrow enough for one run. Tell the agent not to
 commit. The build prompt already asks for `RESULT`, `CHECKS-RUN` and
 `UNCERTAINTIES` at the end, so put the commands you want reported under
 acceptance.
+
+A planner that writes good specs gets more value from a cheap builder. That is
+the trade this tool exists to make.
 
 ## Commands
 
@@ -132,6 +183,9 @@ publishes.
 | 125 | Idle stall. |
 
 ## The training guard
+
+Free tiers are cheap because the provider may train on what the model reads.
+The guard makes that trade explicit.
 
 A model is training class when its id (without `#variant`) matches a glob in
 `HH_TRAINING_MODELS`. Training-class models are refused outside approved roots
