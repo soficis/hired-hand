@@ -1,0 +1,30 @@
+# Runtime state
+*.jsonl
+*.log
+*.tmp
+*.bak
+*.orig
+.env
+.env.*
+__pycache__/
+*.pyc
+*.pyo
+dist/
+build/
+htmlcov/
+.coverage
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+*~
+*.swp
+*.swo
+.vscode/
+.idea/

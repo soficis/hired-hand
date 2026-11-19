@@ -1,0 +1,818 @@
+#!/usr/bin/env bash
+# The body runs inside main() so bash parses the whole file before executing:
+# editing this script while a run is in progress cannot corrupt that run.
+set -euo pipefail
+
+main() {
+  if ((BASH_VERSINFO[0] < 4)); then
+    echo "hiredhand: bash >= 4 is required (found ${BASH_VERSION:-unknown})" >&2
+    exit 2
+  fi
+
+  local hh_home self
+  hh_home="${HH_HOME:-}"
+  if [[ -z "$hh_home" ]]; then
+    self="${BASH_SOURCE[0]}"
+    if readlink -f "$self" >/dev/null 2>&1; then
+      self="$(readlink -f "$self")"
+    fi
+    hh_home="$(cd "$(dirname "$self")/.." && pwd)"
+  fi
+  HH_HOME="$hh_home"
+  export HH_HOME
+
+  # shellcheck source=../lib/hh-core.sh
+  # shellcheck disable=SC1091
+  . "$HH_HOME/lib/hh-core.sh"
+
+  local HH_VERSION="0.1.0"
+
+  usage() {
+    cat <<'EOF'
+hiredhand - run an OpenCode agent from a written spec
+
+Usage:
+  hiredhand build  [--yes] [--model M] [--dry-run] <spec-file>
+  hiredhand review [--model M] [--dry-run] <spec-file>
+  hiredhand outcome <run-id> <pass|partial|fail> [claude_tokens] [note]
+  hiredhand stats [--json]
+  hiredhand approve <dir>
+  hiredhand approvals
+  hiredhand selftest
+  hiredhand help
+  hiredhand --version
+
+build runs the build agent with write access and is refused unless --yes is
+given or HH_YES=1. review runs the review agent read-only. A spec file should
+state the goal, the files in scope, acceptance commands and constraints.
+
+Environment:
+  HH_MODEL              model id (required unless --model is given)
+  HH_RETRY_MODELS       space-separated retry models after provider errors
+  HH_TRAINING_MODELS    space-separated training-class globs (default *-free)
+  HH_STATE_DIR          state directory (default under XDG_STATE_HOME or HOME)
+  HH_CONFIG_DIR         config directory (default under XDG_CONFIG_HOME or HOME)
+  HH_PYTHON             Python interpreter to use
+  HH_OPENCODE           OpenCode executable (default: opencode on PATH)
+  HH_TIMEOUT            wall-clock seconds for a run (default 1800, min 60)
+  HH_IDLE               idle seconds before a stall kill (review 150, build 240)
+  HH_DIRTY              1 allows build on a dirty tree
+  HH_YES                1 is the same as --yes
+  HH_AGENT_BUILD        build agent name (default build)
+  HH_AGENT_REVIEW       review agent name (default plan)
+  HH_ISOLATE            1 runs OpenCode with the bundled minimal config
+  HH_STANDALONE         1 passes --standalone to opencode run
+  HH_SYNC               1 adds the work-synchronously prompt sentence
+  HH_UNFINISHED_CHECK   1 turns an unfinished answer into exit 3
+  HH_SNAPSHOT_PATHS     paths to hash for non-git change detection
+
+Exit codes:
+  0 ok
+  2 usage or configuration error
+  3 refused (training guard, dirty tree) or answer unfinished
+  4 loop or step cap hit
+  6 provider errors (429, 5xx, rate limit, overloaded)
+  124 timeout
+  125 idle stall
+
+build lets the agent edit files and run shell commands; run it in a disposable
+checkout. The training guard is not a sandbox: it denies reads of listed paths
+and indirect-read tools, but not writes.
+EOF
+  }
+
+  paths() {
+    state_dir="${HH_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/hiredhand}"
+    config_dir="${HH_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/hiredhand}"
+    registry="$config_dir/training-approved.txt"
+  }
+
+  run_command() {
+    local mode="$1"
+    shift
+
+    local model="${HH_MODEL:-}" spec="" yes_flag=0 dry_run=0
+    while (($#)); do
+      case "$1" in
+        --yes)
+          if [[ "$mode" != "build" ]]; then
+            echo "hiredhand: --yes is only valid for build" >&2
+            exit 2
+          fi
+          yes_flag=1
+          shift
+          ;;
+        --model)
+          if (($# < 2)); then
+            echo "hiredhand: --model needs a value" >&2
+            exit 2
+          fi
+          model="$2"
+          shift 2
+          ;;
+        --dry-run)
+          dry_run=1
+          shift
+          ;;
+        --*)
+          echo "hiredhand: unknown option $1" >&2
+          exit 2
+          ;;
+        *)
+          if [[ -n "$spec" ]]; then
+            echo "hiredhand: unexpected argument $1" >&2
+            exit 2
+          fi
+          spec="$1"
+          shift
+          ;;
+      esac
+    done
+
+    if [[ -z "$spec" ]]; then
+      echo "hiredhand: a spec file is required" >&2
+      exit 2
+    fi
+    if [[ ! -f "$spec" ]]; then
+      echo "hiredhand: spec file not found: $spec" >&2
+      exit 2
+    fi
+    local spec_dir spec_base spec_abs
+    spec_dir="$(cd "$(dirname -- "$spec")" && pwd)"
+    spec_base="$(basename -- "$spec")"
+    spec_abs="$spec_dir/$spec_base"
+
+    if [[ -z "$model" ]]; then
+      echo "hiredhand: no model selected; set HH_MODEL or pass --model" >&2
+      exit 2
+    fi
+    local model_class_name
+    model_class_name="$(model_class "$model")"
+
+    local root
+    if root="$(git rev-parse --show-toplevel 2>/dev/null)" && [[ -n "$root" ]]; then
+      :
+    else
+      root="$(pwd)"
+    fi
+    cd "$root" || exit 2
+    local in_git=0
+    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      in_git=1
+    fi
+
+    local state_dir config_dir registry
+    paths
+    local root_approved=0
+    if is_approved_root "$root" "$registry"; then
+      root_approved=1
+    fi
+
+    local timeout_s idle_s
+    timeout_s="${HH_TIMEOUT:-1800}"
+    if [[ ! "$timeout_s" =~ ^[0-9]+$ ]] || ((10#$timeout_s < 60)); then
+      echo "hiredhand: HH_TIMEOUT must be an integer >= 60" >&2
+      exit 2
+    fi
+    timeout_s=$((10#$timeout_s))
+    idle_s="${HH_IDLE:-}"
+    if [[ -z "$idle_s" ]]; then
+      if [[ "$mode" == "review" ]]; then
+        idle_s=150
+      else
+        idle_s=240
+      fi
+    fi
+    if [[ ! "$idle_s" =~ ^[0-9]+$ ]] || ((10#$idle_s < 30)); then
+      echo "hiredhand: HH_IDLE must be an integer >= 30" >&2
+      exit 2
+    fi
+    idle_s=$((10#$idle_s))
+
+    hh_find_python || exit 2
+    hh_find_timeout || exit 2
+
+    local agent base_msg guard_root
+    guard_root="$root"
+    if [[ "$mode" == "build" ]]; then
+      agent="${HH_AGENT_BUILD:-build}"
+      base_msg="Implement the task in the attached spec exactly. Stay inside the files it names. Do not commit. Run the checks it lists and report their real output. End with: RESULT, CHECKS-RUN, UNCERTAINTIES."
+    else
+      agent="${HH_AGENT_REVIEW:-plan}"
+      base_msg="Review per the attached spec. Read-only: do not edit files. Be specific (file:line), rank by impact, say what you could not verify. No praise."
+    fi
+
+    local -a guard_g=()
+    if [[ "$model_class_name" == "training" || "$dry_run" == "1" ]]; then
+      local guard_line
+      while IFS= read -r guard_line; do
+        guard_g+=("$guard_line")
+      done < <(load_guard_globs "$root")
+    fi
+
+    local run_model="$model" run_route="explicit" run_msg="$base_msg"
+    local -a run_cmd=()
+    build_run_cmd() {
+      run_cmd=("$HH_TIMEOUT_BIN" "$timeout_s" "$HH_PY" "$HH_HOME/lib/runner.py" --timeout "$((timeout_s - 20))" --idle "$idle_s" --project "$root")
+      if [[ "${HH_SYNC:-0}" == "1" ]]; then
+        run_cmd+=(--sync)
+      fi
+      if [[ "${HH_STANDALONE:-1}" == "0" ]]; then
+        run_cmd+=(--no-standalone)
+      fi
+      if [[ "${HH_ISOLATE:-1}" == "0" ]]; then
+        run_cmd+=(--no-isolate)
+      fi
+      if [[ "${HH_UNFINISHED_CHECK:-0}" == "1" ]]; then
+        run_cmd+=(--unfinished-check)
+      fi
+      run_cmd+=(-- run --agent "$agent" -m "$run_model")
+      if [[ "$mode" == "build" ]]; then
+        run_cmd+=(--auto)
+      fi
+      run_cmd+=(--file "$spec_abs" "$run_msg")
+    }
+
+    if [[ "$dry_run" == "1" ]]; then
+      if [[ "$model_class_name" == "training" ]] && ((${#guard_g[@]})); then
+        run_msg="$(build_guard_prompt "${guard_g[@]}")"$'\n\n'"$base_msg"
+      fi
+      build_run_cmd
+      echo "mode: $mode"
+      echo "model: $model"
+      echo "class: $model_class_name"
+      echo "route: $run_route"
+      echo "root: $root"
+      if ((root_approved)); then
+        echo "approved: yes"
+      else
+        echo "approved: no"
+      fi
+      echo "guard globs: ${#guard_g[@]}"
+      printf 'command:'
+      printf ' %q' "${run_cmd[@]}"
+      printf '\n'
+      exit 0
+    fi
+
+    if [[ "$mode" == "build" && "$yes_flag" != "1" && "${HH_YES:-0}" != "1" ]]; then
+      echo "hiredhand: build can edit files and run shell commands; pass --yes or set HH_YES=1" >&2
+      exit 2
+    fi
+    if ! assert_training_allowed "$model" "$root" "$registry"; then
+      exit 3
+    fi
+
+    local dirty_base=""
+    if [[ "$mode" == "build" && "$in_git" == "1" ]]; then
+      local dirty_status
+      if ! dirty_status="$(git status --porcelain 2>/dev/null)"; then
+        echo "hiredhand: could not read git status" >&2
+        exit 2
+      fi
+      if [[ -n "$dirty_status" ]]; then
+        if [[ "${HH_DIRTY:-0}" != "1" ]]; then
+          echo "hiredhand: the tree has uncommitted changes; commit or stash first (or HH_DIRTY=1)" >&2
+          exit 3
+        fi
+        dirty_base="$(git stash create 2>/dev/null || true)"
+      fi
+    fi
+
+    local start_head="none"
+    if [[ "$in_git" == "1" ]]; then
+      start_head="$(git rev-parse HEAD 2>/dev/null || printf 'none')"
+    fi
+
+    local spec_bytes spec_lines
+    spec_bytes="$(wc -c < "$spec_abs")"
+    spec_lines="$(wc -l < "$spec_abs")"
+
+    if ! mkdir -p "$state_dir/tmp"; then
+      echo "hiredhand: could not create state directory: $state_dir" >&2
+      exit 2
+    fi
+    if [[ "$(hh_platform)" == "posix" ]]; then
+      chmod 700 "$state_dir" "$state_dir/tmp" 2>/dev/null || true
+    fi
+    local log_file="$state_dir/runs.jsonl"
+
+    local -a tmps=()
+    local guard_tmp="" new_file=""
+    new_tmp() {
+      local file
+      file="$(mktemp "$state_dir/tmp/hh.XXXXXX")"
+      tmps+=("$file")
+      new_file="$file"
+    }
+    # shellcheck disable=SC2317,SC2329
+    cleanup() {
+      local file
+      if ((${#tmps[@]})); then
+        for file in "${tmps[@]}"; do
+          rm -f -- "$file"
+        done
+      fi
+    }
+    trap cleanup EXIT
+
+    snapshot() {
+      local -a roots sha_cmd
+      read -r -a roots <<< "${HH_SNAPSHOT_PATHS:-.}"
+      read -r -a sha_cmd <<< "$(hh_sha)"
+      find "${roots[@]}" -type d \( -name .git -o -name node_modules -o -name build -o -name dist -o -name .dart_tool -o -name .venv -o -name __pycache__ \) -prune -o -type f -size -20M -print0 2>/dev/null \
+        | { xargs -0 "${sha_cmd[@]}" 2>/dev/null || true; } \
+        | sed 's/ [*]/ /' \
+        | sort -k2 || true
+    }
+
+    local before="" after=""
+    if [[ "$mode" == "build" && "$in_git" == "0" ]]; then
+      if ! hh_sha >/dev/null; then
+        echo "hiredhand: sha256sum or shasum is required for non-git change detection" >&2
+        exit 2
+      fi
+      new_tmp
+      before="$new_file"
+      snapshot > "$before"
+      echo "hiredhand: not a git repo; snapshotted $(wc -l < "$before") files for change detection" >&2
+    fi
+
+    prepare_guard() {
+      local guard_model="$1"
+      unset OPENCODE_CONFIG
+      if [[ "$(model_class "$guard_model")" != "training" ]]; then
+        run_msg="$base_msg"
+        return 0
+      fi
+      if ! assert_training_allowed "$guard_model" "$root" "$registry"; then
+        return 3
+      fi
+      if [[ "${HH_STANDALONE:-1}" != "1" ]]; then
+        echo "hiredhand: REFUSED: training-class runs require HH_STANDALONE=1 so the guard config takes effect" >&2
+        return 3
+      fi
+      if [[ "${HH_ISOLATE:-1}" != "1" ]]; then
+        echo "hiredhand: REFUSED: training-class runs require HH_ISOLATE=1" >&2
+        return 3
+      fi
+      if ((${#guard_g[@]} == 0)); then
+        local line
+        while IFS= read -r line; do
+          guard_g+=("$line")
+        done < <(load_guard_globs "$root")
+      fi
+      if [[ -z "$guard_tmp" ]]; then
+        new_tmp
+        guard_tmp="$new_file"
+      fi
+      "$HH_PY" "$HH_HOME/lib/guard.py" config "$guard_tmp" "$guard_root" "${guard_g[@]}"
+      local config_path
+      if command -v cygpath >/dev/null 2>&1; then
+        config_path="$(cygpath -w "$guard_tmp" 2>/dev/null || printf '%s' "$guard_tmp")"
+      else
+        config_path="$guard_tmp"
+      fi
+      export OPENCODE_CONFIG="$config_path"
+      echo "hiredhand: training guard: read/glob path denies plus shell/grep/subagent/execute/webfetch/websearch disabled for ${#guard_g[@]} path pattern(s) via OPENCODE_CONFIG (temp config)" >&2
+      local prompt
+      prompt="$(build_guard_prompt "${guard_g[@]}")"
+      run_msg="$prompt"$'\n\n'"$base_msg"
+      return 0
+    }
+
+    local attempt=1 status=0 retry_of="" run_mclass="" retry_next=""
+    local id ts secs out_bytes files ins del new moved out
+    local esc=$'\033'
+    while :; do
+      run_mclass="$(model_class "$run_model")"
+      if ((attempt == 1)); then
+        id="$(date +%Y%m%d-%H%M%S)-$$"
+      else
+        id="$(date +%Y%m%d-%H%M%S)-$$-r1"
+      fi
+      if ! prepare_guard "$run_model"; then
+        echo "hiredhand: REFUSED: '$run_model' is not allowed on root '$root'" >&2
+        exit 3
+      fi
+      echo "hiredhand: [$id] $mode via $run_model (agent=$agent, route=$run_route) in $root" >&2
+      if [[ -n "$retry_of" ]]; then
+        echo "hiredhand: retry of $retry_of after upstream errors (route=retry-upstream)" >&2
+      fi
+
+      local started
+      started="$(date +%s)"
+      new_tmp
+      out="$new_file"
+      build_run_cmd
+      set +e
+      "${run_cmd[@]}" < /dev/null 2>&1 \
+        | sed "s/${esc}\\[[0-9;]*m//g" \
+        | sed '/^[[:space:]]*$/d' \
+        | tee "$out"
+      status=${PIPESTATUS[0]}
+      set -e
+      secs=$(( $(date +%s) - started ))
+      out_bytes="$(wc -c < "$out")"
+
+      files=0
+      ins=0
+      del=0
+      new=0
+      moved="false"
+      if [[ "$mode" == "build" && "$in_git" == "0" ]]; then
+        echo
+        echo "=== hiredhand: changes (snapshot diff; not a git repo) ==="
+        new_tmp
+        after="$new_file"
+        snapshot > "$after"
+        local report
+        report="$("$HH_PY" - "$before" "$after" <<'PY'
+import sys
+
+
+def read_snapshot(path):
+    values = {}
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            parts = line.split(None, 1)
+            if len(parts) != 2:
+                continue
+            digest, name = parts
+            values[name.lstrip("*")] = digest
+    return values
+
+
+before = read_snapshot(sys.argv[1])
+after = read_snapshot(sys.argv[2])
+changed = [name for name in before if name in after and before[name] != after[name]]
+added = [name for name in after if name not in before]
+removed = [name for name in before if name not in after]
+for name in sorted(changed):
+    print("modified: " + name)
+for name in sorted(added):
+    print("new: " + name)
+for name in sorted(removed):
+    print("deleted: " + name)
+print("HH-COUNTS %d %d" % (len(changed) + len(removed), len(added)))
+PY
+)"
+        printf '%s\n' "$report"
+        files="$(printf '%s\n' "$report" | awk '/^HH-COUNTS / { print $2 }')"
+        new="$(printf '%s\n' "$report" | awk '/^HH-COUNTS / { print $3 }')"
+        files="${files:-0}"
+        new="${new:-0}"
+      elif [[ "$mode" == "build" ]]; then
+        echo
+        echo "=== hiredhand: changes ==="
+        local now_head
+        now_head="$(git rev-parse HEAD 2>/dev/null || printf 'none')"
+        if [[ "$now_head" != "$start_head" ]]; then
+          moved="true"
+          echo "WARNING: HEAD moved (the agent committed?)"
+        fi
+        git diff --stat || true
+        git ls-files --others --exclude-standard | sed 's/^/new: /' || true
+        local short_stat=""
+        if [[ -n "$dirty_base" ]]; then
+          short_stat="$(git diff --shortstat "$dirty_base" 2>/dev/null || true)"
+        else
+          short_stat="$(git diff --shortstat 2>/dev/null || true)"
+        fi
+        read -r files ins del < <(printf '%s\n' "$short_stat" | awk '{ f=$1; i=0; d=0; for (k=1; k<=NF; k++) { if ($k ~ /insertion/) i=$(k-1); if ($k ~ /deletion/) d=$(k-1) } print f+0, i+0, d+0 }') || { files=0; ins=0; del=0; }
+        new="$(git ls-files --others --exclude-standard 2>/dev/null | wc -l)" || new=0
+      fi
+
+      if [[ "$status" == "124" ]]; then
+        echo "hiredhand: TIMED OUT after ${timeout_s}s" >&2
+      fi
+      if [[ "$status" == "125" ]]; then
+        echo "hiredhand: STALLED (no output for ${idle_s}s): the watchdog killed the run. Retry, or choose a different model." >&2
+      fi
+      if [[ "$status" == "3" ]]; then
+        echo "hiredhand: the model ended while saying it was still waiting on something: treat the output as INCOMPLETE" >&2
+      fi
+      if [[ "$status" == "4" ]]; then
+        echo "hiredhand: the watchdog stopped a LOOP or runaway step count: the output is not trustworthy, and this is not auto-retried. Read the partial output and re-dispatch with a narrower spec." >&2
+      fi
+      if [[ "$status" == "6" ]]; then
+        echo "hiredhand: UPSTREAM ERRORS (provider 429/5xx/rate limit/timeout) on $run_model" >&2
+      fi
+
+      if [[ "$run_mclass" == "training" ]]; then
+        "$HH_PY" "$HH_HOME/lib/guard.py" mentions "$out" "$guard_root" "${guard_g[@]}" || true
+      fi
+
+      ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      local log_line
+      log_line="$("$HH_PY" - "$id" "$ts" "$root" "$mode" "$run_model" "$run_mclass" "$run_route" "$spec_bytes" "$spec_lines" "$secs" "$status" "$out_bytes" "$files" "$ins" "$del" "$new" "$moved" "$retry_of" <<'PY'
+import json
+import sys
+
+values = sys.argv[1:]
+document = {
+    "type": "run",
+    "v": "0.1.0",
+    "id": values[0],
+    "ts": values[1],
+    "project": values[2],
+    "mode": values[3],
+    "model": values[4],
+    "model_class": values[5],
+    "route": values[6],
+    "spec_bytes": int(values[7]),
+    "spec_lines": int(values[8]),
+    "seconds": int(values[9]),
+    "exit": int(values[10]),
+    "out_bytes": int(values[11]),
+    "files": int(values[12]),
+    "ins": int(values[13]),
+    "del": int(values[14]),
+    "new": int(values[15]),
+    "head_moved": values[16] == "true",
+    "retry_of": values[17] or None,
+}
+print(json.dumps(document))
+PY
+)"
+      printf '%s\n' "$log_line" >> "$log_file"
+      echo "hiredhand: logged run $id - record the result with: hiredhand outcome $id <verdict> [claude_tokens] [note]" >&2
+
+      retry_next=""
+      if ((attempt == 1)); then
+        retry_next="$(retry_model "$status" "$run_mclass" "$run_model")"
+      fi
+      if [[ -n "$retry_next" ]]; then
+        echo "hiredhand: retrying once with $retry_next (route=retry-upstream; rc 6 is a provider failure, not the model's)" >&2
+        if ! assert_training_allowed "$retry_next" "$root" "$registry"; then
+          exit 3
+        fi
+        retry_of="$id"
+        run_model="$retry_next"
+        run_route="retry-upstream"
+        attempt=2
+        continue
+      fi
+      break
+    done
+    exit "$status"
+  }
+
+  outcome_command() {
+    if (($# < 2 || $# > 4)); then
+      echo "usage: hiredhand outcome <run-id> <pass|partial|fail> [claude_tokens] [note]" >&2
+      exit 2
+    fi
+    local run_id="$1" verdict="$2" tokens="${3:-}" note="${4:-}"
+    case "$verdict" in
+      pass|partial|fail) ;;
+      *)
+        echo "hiredhand: verdict must be pass, partial or fail" >&2
+        exit 2
+        ;;
+    esac
+    if [[ -n "$tokens" && ! "$tokens" =~ ^[0-9]+$ ]]; then
+      echo "hiredhand: claude_tokens must be an integer or empty" >&2
+      exit 2
+    fi
+    hh_find_python || exit 2
+    local state_dir config_dir registry
+    paths
+    if ! mkdir -p "$state_dir"; then
+      echo "hiredhand: could not create state directory: $state_dir" >&2
+      exit 2
+    fi
+    if [[ "$(hh_platform)" == "posix" ]]; then
+      chmod 700 "$state_dir" 2>/dev/null || true
+    fi
+    local stamp line
+    stamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    line="$("$HH_PY" - "$run_id" "$stamp" "$verdict" "$tokens" "$note" <<'PY'
+import json
+import sys
+
+run_id, stamp, verdict, tokens, note = sys.argv[1:6]
+document = {
+    "type": "outcome",
+    "v": "0.1.0",
+    "id": run_id,
+    "ts": stamp,
+    "verdict": verdict,
+    "claude_tokens_est": int(tokens) if tokens else None,
+    "note": note,
+}
+print(json.dumps(document))
+PY
+)"
+    printf '%s\n' "$line" >> "$state_dir/runs.jsonl"
+    echo "hiredhand: recorded outcome for $run_id: $verdict"
+  }
+
+  stats_command() {
+    local json_flag=0
+    while (($#)); do
+      case "$1" in
+        --json) json_flag=1; shift ;;
+        *)
+          echo "hiredhand: unknown stats option $1" >&2
+          exit 2
+          ;;
+      esac
+    done
+    hh_find_python || exit 2
+    local state_dir config_dir registry
+    paths
+    "$HH_PY" - "$state_dir/runs.jsonl" "$json_flag" <<'PY'
+import json
+import statistics
+import sys
+
+path, as_json = sys.argv[1], sys.argv[2] == "1"
+try:
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        lines = handle.read().splitlines()
+except OSError:
+    lines = []
+
+runs = []
+outcomes = {}
+for line in lines:
+    try:
+        item = json.loads(line)
+    except (TypeError, ValueError):
+        continue
+    if not isinstance(item, dict):
+        continue
+    if item.get("type") == "run":
+        runs.append(item)
+    elif item.get("type") == "outcome":
+        outcomes[item.get("id")] = item.get("verdict")
+
+models = {}
+for run in runs:
+    name = str(run.get("model") or "?")
+    entry = models.setdefault(
+        name,
+        {"model": name, "runs": 0, "pass": 0, "partial": 0, "fail": 0, "seconds": []},
+    )
+    entry["runs"] += 1
+    seconds = run.get("seconds")
+    if isinstance(seconds, (int, float)):
+        entry["seconds"].append(seconds)
+    verdict = outcomes.get(run.get("id"))
+    if verdict in ("pass", "partial", "fail"):
+        entry[verdict] += 1
+
+for entry in models.values():
+    seconds = sorted(entry.pop("seconds"))
+    if seconds:
+        median = statistics.median(seconds)
+        if isinstance(median, float) and median.is_integer():
+            median = int(median)
+    else:
+        median = None
+    entry["median_seconds"] = median
+
+items = sorted(models.values(), key=lambda item: item["model"])
+if as_json:
+    print(json.dumps({"runs": len(runs), "models": items}))
+else:
+    if not runs:
+        print("hiredhand: no runs logged")
+    for entry in items:
+        print(
+            "%s: runs=%d pass=%d partial=%d fail=%d median_seconds=%s"
+            % (
+                entry["model"],
+                entry["runs"],
+                entry["pass"],
+                entry["partial"],
+                entry["fail"],
+                entry["median_seconds"],
+            )
+        )
+PY
+  }
+
+  approve_command() {
+    if (($# != 1)); then
+      echo "usage: hiredhand approve <dir>" >&2
+      exit 2
+    fi
+    local target="$1"
+    if [[ -z "$target" || ! -d "$target" ]]; then
+      echo "hiredhand: approve needs an existing directory" >&2
+      exit 2
+    fi
+    local state_dir config_dir registry
+    paths
+    if ! mkdir -p "$config_dir"; then
+      echo "hiredhand: could not create config directory: $config_dir" >&2
+      exit 2
+    fi
+    if [[ "$(hh_platform)" == "posix" ]]; then
+      chmod 700 "$config_dir" 2>/dev/null || true
+    fi
+    local normalized present line entry
+    normalized="$(norm_path "$target")"
+    present=0
+    if [[ -f "$registry" ]]; then
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        line="$(trim_ws "$line")"
+        if [[ -z "$line" || "$line" == \#* ]]; then
+          continue
+        fi
+        entry="$(norm_path "$line")"
+        if [[ "$entry" == "$normalized" ]]; then
+          present=1
+          break
+        fi
+      done < "$registry"
+    fi
+    if ((present)); then
+      echo "hiredhand: already approved: $normalized"
+    else
+      printf '%s\n' "$normalized" >> "$registry"
+      echo "hiredhand: approved: $normalized"
+    fi
+  }
+
+  approvals_command() {
+    local state_dir config_dir registry
+    paths
+    if [[ ! -f "$registry" ]]; then
+      echo "hiredhand: no approved roots"
+      return 0
+    fi
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="${line%$'\r'}"
+      line="$(trim_ws "$line")"
+      if [[ -z "$line" || "$line" == \#* ]]; then
+        continue
+      fi
+      printf '%s\n' "$line"
+    done < "$registry"
+  }
+
+  selftest_command() {
+    if [[ -f "$HH_HOME/tests/test_core.sh" ]]; then
+      if bash "$HH_HOME/tests/test_core.sh"; then
+        exit 0
+      else
+        exit 1
+      fi
+    fi
+    hh_find_python || exit 1
+    if [[ "$(model_class 'provider/model-name')" != "standard" ]]; then
+      echo "hiredhand: selftest failed: standard model classification" >&2
+      exit 1
+    fi
+    if [[ "$(model_class 'provider/model-name-free')" != "training" ]]; then
+      echo "hiredhand: selftest failed: training model classification" >&2
+      exit 1
+    fi
+    echo "hiredhand: selftest ok"
+  }
+
+  local command_name="${1:-}"
+  if (($#)); then
+    shift
+  fi
+  case "$command_name" in
+    build|review)
+      run_command "$command_name" "$@"
+      ;;
+    outcome)
+      outcome_command "$@"
+      ;;
+    stats)
+      stats_command "$@"
+      ;;
+    approve)
+      approve_command "$@"
+      ;;
+    approvals)
+      approvals_command
+      ;;
+    selftest)
+      selftest_command
+      ;;
+    help|-h|--help)
+      usage
+      ;;
+    --version)
+      echo "hiredhand $HH_VERSION"
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""Fake opencode executable used by the runner tests."""
+
+import json
+import os
+import sys
+import time
+
+
+def emit(event):
+    sys.stdout.write(json.dumps(event) + "\n")
+    sys.stdout.flush()
+
+
+def record():
+    log = os.environ.get("FAKE_ARGV_LOG")
+    if log:
+        data = {
+            "argv": sys.argv[1:],
+            "OPENCODE_CONFIG": os.environ.get("OPENCODE_CONFIG"),
+            "XDG_CONFIG_HOME": os.environ.get("XDG_CONFIG_HOME"),
+        }
+        with open(log, "a", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(data) + "\n")
+    pid_file = os.environ.get("FAKE_PID_FILE")
+    if pid_file:
+        with open(pid_file, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(str(os.getpid()) + "\n")
+
+
+def text(value):
+    emit({"type": "text", "part": {"text": value}})
+
+
+def edit():
+    name = os.environ.get("FAKE_EDIT_FILE", "created.txt")
+    parent = os.path.dirname(name)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(name, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write("hello\n")
+
+
+def main():
+    record()
+    mode = os.environ.get("FAKE_MODE", "ok")
+    if mode == "fail":
+        sys.stderr.write("boom\n")
+        return 1
+    if mode == "upstream":
+        emit({"type": "error", "error": {"message": "429 Too Many Requests"}})
+        emit({"type": "error", "error": {"message": "provider overloaded"}})
+        return 1
+    if mode == "loop":
+        for _ in range(4):
+            emit({"type": "step_start", "part": {}})
+            time.sleep(0.1)
+        time.sleep(30)
+        return 0
+    if mode == "stall":
+        text("working")
+        time.sleep(600)
+        return 0
+    if mode == "slow":
+        while True:
+            text("still working")
+            time.sleep(1)
+    if mode == "edit":
+        edit()
+    emit({"type": "step_start", "part": {}})
+    if mode == "unfinished":
+        text("The background job is still running, will fold the results in later.")
+    elif mode == "unicode":
+        text("Done. RESULT: ok \u2192 next")
+    elif mode == "ok":
+        text("Done. RESULT: ok")
+    else:
+        text("Done. RESULT: ok")
+    emit({"type": "step_finish", "part": {"tokens": {"input": 10, "output": 5}}})
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
